@@ -126,6 +126,16 @@ interface NetworkAlert {
   resolved: boolean
 }
 
+interface PortInfo {
+  port: number
+  protocol: 'tcp' | 'udp'
+  state: 'open' | 'closed' | 'filtered' | 'listening'
+  service: string
+  process?: string
+  pid?: number
+  localAddress: string
+}
+
 function NetworkPage() {
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([])
   const [connections, setConnections] = useState<NetworkConnection[]>([])
@@ -133,12 +143,22 @@ function NetworkPage() {
   const [latency, setLatency] = useState<NetworkLatency[]>([])
   const [firewallRules, setFirewallRules] = useState<FirewallRule[]>([])
   const [alerts, setAlerts] = useState<NetworkAlert[]>([])
+  const [ports, setPorts] = useState<PortInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [searchTerm, setSearchTerm] = useState("")
   const [typeFilter, setTypeFilter] = useState<string>("all")
   const [statusFilter, setStatusFilter] = useState<string>("all")
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [selectedInterface, setSelectedInterface] = useState<NetworkInterface | null>(null)
+  const [portSearchTerm, setPortSearchTerm] = useState("")
+  const [protocolFilter, setProtocolFilter] = useState<string>("all")
+  const [portStateFilter, setPortStateFilter] = useState<string>("all")
+  const [showAddPortDialog, setShowAddPortDialog] = useState(false)
+  const [showScanPortDialog, setShowScanPortDialog] = useState(false)
+  const [showPortForwardDialog, setShowPortForwardDialog] = useState(false)
+  const [newPort, setNewPort] = useState({ port: '', protocol: 'tcp', action: 'open' })
+  const [scanPort, setScanPort] = useState({ port: '', protocol: 'tcp', target: 'localhost' })
+  const [portForward, setPortForward] = useState({ sourcePort: '', target: '', targetPort: '', protocol: 'tcp' })
 
   const fetchNetwork = async () => {
     try {
@@ -151,6 +171,7 @@ function NetworkPage() {
         setLatency(data.data?.latency || [])
         setFirewallRules(data.data?.firewall || [])
         setAlerts(data.data?.alerts || [])
+        setPorts(data.data?.ports || [])
       }
     } catch (error) {
       console.error('Failed to fetch network data:', error)
@@ -176,6 +197,27 @@ function NetworkPage() {
       }
     } catch (error) {
       console.error('Failed to perform interface action:', error)
+    }
+  }
+
+  const handlePortAction = async (action: string, portData: any) => {
+    try {
+      const response = await fetch('/api/network', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action, ...portData }),
+      })
+
+      if (response.ok) {
+        const result = await response.json()
+        console.log(result.message)
+        fetchNetwork()
+        return result
+      }
+    } catch (error) {
+      console.error('Failed to perform port action:', error)
     }
   }
 
@@ -218,6 +260,26 @@ function NetworkPage() {
     }
   }
 
+  const getPortStateColor = (state: string) => {
+    switch (state) {
+      case "open": return "bg-green-500"
+      case "closed": return "bg-red-500"
+      case "filtered": return "bg-yellow-500"
+      case "listening": return "bg-blue-500"
+      default: return "bg-gray-500"
+    }
+  }
+
+  const getPortStateText = (state: string) => {
+    switch (state) {
+      case "open": return "Open"
+      case "closed": return "Closed"
+      case "filtered": return "Filtered"
+      case "listening": return "Listening"
+      default: return "Unknown"
+    }
+  }
+
   const filteredInterfaces = interfaces.filter(item => {
     const matchesSearch = item.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                          item.ip.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -225,6 +287,15 @@ function NetworkPage() {
     const matchesType = typeFilter === "all" || item.type === typeFilter
     const matchesStatus = statusFilter === "all" || item.status === statusFilter
     return matchesSearch && matchesType && matchesStatus
+  })
+
+  const filteredPorts = ports.filter(item => {
+    const matchesSearch = item.port.toString().includes(portSearchTerm) ||
+                         item.service.toLowerCase().includes(portSearchTerm.toLowerCase()) ||
+                         (item.process && item.process.toLowerCase().includes(portSearchTerm.toLowerCase()))
+    const matchesProtocol = protocolFilter === "all" || item.protocol === protocolFilter
+    const matchesState = portStateFilter === "all" || item.state === portStateFilter
+    return matchesSearch && matchesProtocol && matchesState
   })
 
   useEffect(() => {
@@ -388,9 +459,10 @@ function NetworkPage() {
 
         {/* Main Content */}
         <Tabs defaultValue="interfaces" className="space-y-4">
-          <TabsList className="grid w-full grid-cols-5">
+          <TabsList className="grid w-full grid-cols-6">
             <TabsTrigger value="interfaces">Interfaces</TabsTrigger>
             <TabsTrigger value="connections">Connections</TabsTrigger>
+            <TabsTrigger value="ports">Ports</TabsTrigger>
             <TabsTrigger value="bandwidth">Bandwidth</TabsTrigger>
             <TabsTrigger value="firewall">Firewall</TabsTrigger>
             <TabsTrigger value="alerts">Alerts</TabsTrigger>
@@ -652,6 +724,378 @@ function NetworkPage() {
                     <div className="text-center">
                       <Globe className="w-8 h-8 mx-auto mb-2 text-muted-foreground" />
                       <p className="text-muted-foreground">No active connections</p>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent value="ports" className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-medium">Port Management</h3>
+                <p className="text-sm text-muted-foreground">
+                  Monitor and manage open ports and services
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <Dialog open={showScanPortDialog} onOpenChange={setShowScanPortDialog}>
+                  <DialogTrigger asChild>
+                    <Button variant="outline">
+                      <Search className="w-4 h-4 mr-2" />
+                      Scan Port
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle>Scan Port</DialogTitle>
+                      <DialogDescription>
+                        Check if a specific port is open or closed
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="space-y-4">
+                      <div>
+                        <Label htmlFor="scan-port">Port Number</Label>
+                        <Input
+                          id="scan-port"
+                          type="number"
+                          placeholder="80"
+                          value={scanPort.port}
+                          onChange={(e) => setScanPort({ ...scanPort, port: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="scan-protocol">Protocol</Label>
+                        <Select value={scanPort.protocol} onValueChange={(value) => setScanPort({ ...scanPort, protocol: value })}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="tcp">TCP</SelectItem>
+                            <SelectItem value="udp">UDP</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div>
+                        <Label htmlFor="scan-target">Target Host</Label>
+                        <Input
+                          id="scan-target"
+                          placeholder="localhost"
+                          value={scanPort.target}
+                          onChange={(e) => setScanPort({ ...scanPort, target: e.target.value })}
+                        />
+                      </div>
+                      <div className="flex gap-2">
+                        <Button 
+                          onClick={() => {
+                            handlePortAction('scanPort', { 
+                              port: parseInt(scanPort.port), 
+                              protocol: scanPort.protocol, 
+                              target: scanPort.target 
+                            })
+                            setShowScanPortDialog(false)
+                          }}
+                          disabled={!scanPort.port}
+                        >
+                          Scan Port
+                        </Button>
+                        <Button variant="outline" onClick={() => setShowScanPortDialog(false)}>
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  </DialogContent>
+                </Dialog>
+                
+                <Dialog open={showAddPortDialog} onOpenChange={setShowAddPortDialog}>
+                  <DialogTrigger asChild>
+                    <Button>
+                      <Plus className="w-4 h-4 mr-2" />
+                      Add Port Rule
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle>Add Port Rule</DialogTitle>
+                      <DialogDescription>
+                        Open or close a specific port through firewall
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="space-y-4">
+                      <div>
+                        <Label htmlFor="new-port">Port Number</Label>
+                        <Input
+                          id="new-port"
+                          type="number"
+                          placeholder="8080"
+                          value={newPort.port}
+                          onChange={(e) => setNewPort({ ...newPort, port: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="new-protocol">Protocol</Label>
+                        <Select value={newPort.protocol} onValueChange={(value) => setNewPort({ ...newPort, protocol: value })}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="tcp">TCP</SelectItem>
+                            <SelectItem value="udp">UDP</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div>
+                        <Label htmlFor="new-action">Action</Label>
+                        <Select value={newPort.action} onValueChange={(value) => setNewPort({ ...newPort, action: value })}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="open">Open Port</SelectItem>
+                            <SelectItem value="close">Close Port</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button 
+                          onClick={() => {
+                            const action = newPort.action === 'open' ? 'openPort' : 'closePort'
+                            handlePortAction(action, { 
+                              port: parseInt(newPort.port), 
+                              protocol: newPort.protocol 
+                            })
+                            setShowAddPortDialog(false)
+                            setNewPort({ port: '', protocol: 'tcp', action: 'open' })
+                          }}
+                          disabled={!newPort.port}
+                        >
+                          {newPort.action === 'open' ? 'Open Port' : 'Close Port'}
+                        </Button>
+                        <Button variant="outline" onClick={() => setShowAddPortDialog(false)}>
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  </DialogContent>
+                </Dialog>
+                
+                <Dialog open={showPortForwardDialog} onOpenChange={setShowPortForwardDialog}>
+                  <DialogTrigger asChild>
+                    <Button variant="outline">
+                      <Router className="w-4 h-4 mr-2" />
+                      Port Forward
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle>Port Forwarding</DialogTitle>
+                      <DialogDescription>
+                        Set up port forwarding to redirect traffic to another host
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="space-y-4">
+                      <div>
+                        <Label htmlFor="source-port">Source Port</Label>
+                        <Input
+                          id="source-port"
+                          type="number"
+                          placeholder="8080"
+                          value={portForward.sourcePort}
+                          onChange={(e) => setPortForward({ ...portForward, sourcePort: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="target-host">Target Host</Label>
+                        <Input
+                          id="target-host"
+                          placeholder="192.168.1.100"
+                          value={portForward.target}
+                          onChange={(e) => setPortForward({ ...portForward, target: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="target-port">Target Port</Label>
+                        <Input
+                          id="target-port"
+                          type="number"
+                          placeholder="80"
+                          value={portForward.targetPort}
+                          onChange={(e) => setPortForward({ ...portForward, targetPort: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <Label htmlFor="forward-protocol">Protocol</Label>
+                        <Select value={portForward.protocol} onValueChange={(value) => setPortForward({ ...portForward, protocol: value })}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="tcp">TCP</SelectItem>
+                            <SelectItem value="udp">UDP</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button 
+                          onClick={() => {
+                            handlePortAction('portForward', { 
+                              port: parseInt(portForward.sourcePort), 
+                              target: portForward.target,
+                              targetPort: parseInt(portForward.targetPort) || parseInt(portForward.sourcePort),
+                              protocol: portForward.protocol
+                            })
+                            setShowPortForwardDialog(false)
+                            setPortForward({ sourcePort: '', target: '', targetPort: '', protocol: 'tcp' })
+                          }}
+                          disabled={!portForward.sourcePort || !portForward.target}
+                        >
+                          Set Up Forwarding
+                        </Button>
+                        <Button variant="outline" onClick={() => setShowPortForwardDialog(false)}>
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  </DialogContent>
+                </Dialog>
+              </div>
+            </div>
+
+            {/* Port Filters */}
+            <Card>
+              <CardContent className="pt-6">
+                <div className="flex flex-col sm:flex-row gap-4">
+                  <div className="relative flex-1">
+                    <Search className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
+                    <Input
+                      placeholder="Search by port, service, or process..."
+                      value={portSearchTerm}
+                      onChange={(e) => setPortSearchTerm(e.target.value)}
+                      className="pl-10"
+                    />
+                  </div>
+                  <Select value={protocolFilter} onValueChange={setProtocolFilter}>
+                    <SelectTrigger className="w-full sm:w-[140px]">
+                      <Filter className="w-4 h-4 mr-2" />
+                      <SelectValue placeholder="Protocol" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All Protocols</SelectItem>
+                      <SelectItem value="tcp">TCP</SelectItem>
+                      <SelectItem value="udp">UDP</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Select value={portStateFilter} onValueChange={setPortStateFilter}>
+                    <SelectTrigger className="w-full sm:w-[140px]">
+                      <Filter className="w-4 h-4 mr-2" />
+                      <SelectValue placeholder="State" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All States</SelectItem>
+                      <SelectItem value="open">Open</SelectItem>
+                      <SelectItem value="closed">Closed</SelectItem>
+                      <SelectItem value="listening">Listening</SelectItem>
+                      <SelectItem value="filtered">Filtered</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Ports List */}
+            <div className="grid gap-4">
+              {filteredPorts.map((port, index) => (
+                <Card key={index}>
+                  <CardContent className="pt-6">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                      <div className="space-y-2">
+                        <div className="flex items-center space-x-2">
+                          <div className={`w-3 h-3 rounded-full ${getPortStateColor(port.state)}`} />
+                          <span className="text-sm font-medium">{port.protocol.toUpperCase()}</span>
+                          <Badge variant="outline" className="capitalize">
+                            {getPortStateText(port.state)}
+                          </Badge>
+                        </div>
+                        <div className="text-lg font-bold">{port.port}</div>
+                        <div className="text-sm text-muted-foreground">
+                          Service: {port.service}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {port.localAddress}
+                        </div>
+                      </div>
+                      
+                      <div className="space-y-2">
+                        <div className="text-sm font-medium">Process</div>
+                        <div className="text-xs text-muted-foreground">
+                          {port.process || 'N/A'}
+                        </div>
+                        {port.pid && (
+                          <div className="text-xs text-muted-foreground">
+                            PID: {port.pid}
+                          </div>
+                        )}
+                      </div>
+                      
+                      <div className="space-y-2">
+                        <div className="text-sm font-medium">Status</div>
+                        <div className="text-xs">
+                          {port.state === 'listening' && (
+                            <span className="text-green-600">● Listening for connections</span>
+                          )}
+                          {port.state === 'open' && (
+                            <span className="text-blue-600">● Open and active</span>
+                          )}
+                          {port.state === 'closed' && (
+                            <span className="text-red-600">● Closed</span>
+                          )}
+                          {port.state === 'filtered' && (
+                            <span className="text-yellow-600">● Filtered by firewall</span>
+                          )}
+                        </div>
+                      </div>
+                      
+                      <div className="space-y-2">
+                        <div className="text-sm font-medium">Actions</div>
+                        <div className="flex flex-wrap gap-2">
+                          {port.state === 'closed' || port.state === 'filtered' ? (
+                            <Button 
+                              variant="outline" 
+                              size="sm"
+                              onClick={() => handlePortAction('openPort', { port: port.port, protocol: port.protocol })}
+                            >
+                              <Unlock className="w-3 h-3 mr-1" />
+                              Open
+                            </Button>
+                          ) : (
+                            <Button 
+                              variant="outline" 
+                              size="sm"
+                              onClick={() => handlePortAction('closePort', { port: port.port, protocol: port.protocol })}
+                            >
+                              <Lock className="w-3 h-3 mr-1" />
+                              Close
+                            </Button>
+                          )}
+                          <Button variant="outline" size="sm">
+                            <Eye className="w-3 h-3 mr-1" />
+                            Details
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+              
+              {filteredPorts.length === 0 && (
+                <Card>
+                  <CardContent className="flex items-center justify-center h-32">
+                    <div className="text-center">
+                      <Shield className="w-8 h-8 mx-auto mb-2 text-muted-foreground" />
+                      <p className="text-muted-foreground">No ports found</p>
+                      <p className="text-sm text-muted-foreground">Try adjusting your filters</p>
                     </div>
                   </CardContent>
                 </Card>

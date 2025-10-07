@@ -35,9 +35,36 @@ interface NetworkConnection {
   process: string
 }
 
+interface PortInfo {
+  port: number
+  protocol: 'tcp' | 'udp'
+  state: 'open' | 'closed' | 'filtered' | 'listening'
+  service: string
+  process?: string
+  pid?: number
+  localAddress: string
+}
+
+interface FirewallRule {
+  id: string
+  chain: 'input' | 'output' | 'forward'
+  action: 'accept' | 'drop' | 'reject'
+  protocol: 'tcp' | 'udp' | 'icmp' | 'any'
+  source: string
+  destination: string
+  sourcePort: string
+  destinationPort: string
+  enabled: boolean
+  description: string
+  hits: number
+  lastHit: string
+}
+
 interface NetworkData {
   interfaces: NetworkInterface[]
   connections: NetworkConnection[]
+  ports: PortInfo[]
+  firewall: FirewallRule[]
   bandwidth: {
     download: number // Mbps
     upload: number // Mbps
@@ -273,6 +300,118 @@ async function getRealNetworkData(): Promise<NetworkData> {
       console.log('Failed to get connection info:', connError)
     }
     
+    // Get open ports and services
+    const ports: PortInfo[] = []
+    try {
+      // Use netstat to get listening ports
+      const { stdout: netstatOutput } = await execAsync('netstat -tlnp 2>/dev/null || ss -tlnp 2>/dev/null')
+      const netstatLines = netstatOutput.split('\n').slice(1) // Skip header
+      
+      for (const line of netstatLines) {
+        const parts = line.split(/\s+/).filter(p => p)
+        if (parts.length >= 4) {
+          const [protocol, , localAddress, state] = parts
+          const processInfo = parts[4] || ''
+          
+          // Extract port and address
+          const addressMatch = localAddress.match(/(?:.*:)?(\d+)$/)
+          if (!addressMatch) continue
+          
+          const port = parseInt(addressMatch[1])
+          const localIp = localAddress.includes(':') ? localAddress.split(':')[0] : '0.0.0.0'
+          
+          // Extract PID and process name
+          let pid = 0
+          let process = 'Unknown'
+          const pidMatch = processInfo.match(/(\d+)\/(.+)/)
+          if (pidMatch) {
+            pid = parseInt(pidMatch[1])
+            process = pidMatch[2]
+          }
+          
+          // Get service name
+          let service = 'unknown'
+          try {
+            const { stdout: serviceOutput } = await execAsync(`getent services ${port} 2>/dev/null || cat /etc/services 2>/dev/null | grep "^\s*[^#].*\s${port}/" | head -1`)
+            if (serviceOutput.trim()) {
+              const serviceLine = serviceOutput.split('\n')[0]
+              const serviceName = serviceLine.split(/\s+/)[0]
+              if (serviceName) service = serviceName
+            }
+          } catch (e) {
+            // Ignore service lookup errors
+          }
+          
+          ports.push({
+            port,
+            protocol: protocol.toLowerCase() as 'tcp' | 'udp',
+            state: state.includes('LISTEN') ? 'listening' : 'open',
+            service,
+            process: process || undefined,
+            pid: pid || undefined,
+            localAddress: localIp
+          })
+        }
+      }
+    } catch (portError) {
+      console.log('Failed to get port info:', portError)
+    }
+    
+    // Get firewall rules
+    const firewall: FirewallRule[] = []
+    try {
+      const { stdout: iptablesOutput } = await execAsync('iptables -L -n -v --line-numbers 2>/dev/null || iptables -L -n -v 2>/dev/null')
+      const lines = iptablesOutput.split('\n')
+      let currentChain = ''
+      
+      for (const line of lines) {
+        const trimmedLine = line.trim()
+        
+        // Detect chain headers
+        if (trimmedLine.startsWith('Chain')) {
+          const chainMatch = trimmedLine.match(/Chain\s+(\w+)/)
+          if (chainMatch) {
+            currentChain = chainMatch[1].toLowerCase()
+          }
+          continue
+        }
+        
+        // Skip header lines and empty lines
+        if (trimmedLine === '' || trimmedLine.startsWith('pkts') || trimmedLine.startsWith('num')) {
+          continue
+        }
+        
+        // Parse rule
+        const parts = trimmedLine.split(/\s+/)
+        if (parts.length >= 8) {
+          const [, packets, bytes, , , proto, source, destination, ...rest] = parts
+          
+          // Extract additional info
+          const extraInfo = rest.join(' ')
+          const portMatch = extraInfo.match(/dpt:(\d+)/)
+          const sportMatch = extraInfo.match(/spt:(\d+)/)
+          const actionMatch = extraInfo.match(/(ACCEPT|DROP|REJECT)/)
+          
+          firewall.push({
+            id: `${currentChain}-${firewall.length + 1}`,
+            chain: currentChain as 'input' | 'output' | 'forward',
+            action: (actionMatch ? actionMatch[1].toLowerCase() : 'accept') as 'accept' | 'drop' | 'reject',
+            protocol: proto.toLowerCase() as 'tcp' | 'udp' | 'icmp' | 'any',
+            source,
+            destination,
+            sourcePort: sportMatch ? sportMatch[1] : 'any',
+            destinationPort: portMatch ? portMatch[1] : 'any',
+            enabled: true,
+            description: extraInfo,
+            hits: parseInt(packets) || 0,
+            lastHit: new Date().toISOString()
+          })
+        }
+      }
+    } catch (firewallError) {
+      console.log('Failed to get firewall info:', firewallError)
+    }
+    
     // Get bandwidth usage (calculate from /proc/net/dev)
     let bandwidth = { download: 0, upload: 0 }
     try {
@@ -332,6 +471,8 @@ async function getRealNetworkData(): Promise<NetworkData> {
     return {
       interfaces,
       connections,
+      ports,
+      firewall,
       bandwidth,
       latency,
       packetLoss,
@@ -365,6 +506,65 @@ async function getRealNetworkData(): Promise<NetworkData> {
         txErrors: 0
       }],
       connections: [],
+      ports: [
+        {
+          port: 22,
+          protocol: 'tcp',
+          state: 'listening',
+          service: 'ssh',
+          process: 'sshd',
+          pid: 1234,
+          localAddress: '0.0.0.0'
+        },
+        {
+          port: 80,
+          protocol: 'tcp',
+          state: 'listening',
+          service: 'http',
+          process: 'nginx',
+          pid: 5678,
+          localAddress: '0.0.0.0'
+        },
+        {
+          port: 443,
+          protocol: 'tcp',
+          state: 'listening',
+          service: 'https',
+          process: 'nginx',
+          pid: 5678,
+          localAddress: '0.0.0.0'
+        }
+      ],
+      firewall: [
+        {
+          id: 'input-1',
+          chain: 'input',
+          action: 'accept',
+          protocol: 'tcp',
+          source: '0.0.0.0/0',
+          destination: '0.0.0.0/0',
+          sourcePort: 'any',
+          destinationPort: '22',
+          enabled: true,
+          description: 'Allow SSH',
+          hits: 150,
+          lastHit: new Date().toISOString()
+        },
+        {
+          id: 'input-2',
+          chain: 'input',
+          action: 'accept',
+          protocol: 'tcp',
+          source: '0.0.0.0/0',
+          destination: '0.0.0.0/0',
+          sourcePort: 'any',
+          destinationPort: '80',
+          enabled: true,
+          description: 'Allow HTTP',
+          hits: 1250,
+          lastHit: new Date().toISOString()
+        }
+      ],
       bandwidth: {
         download: 1024,  // Total MB downloaded
         upload: 512     // Total MB uploaded
@@ -401,7 +601,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { action, interface: interfaceName, target } = body
+    const { action, interface: interfaceName, target, port, protocol, ruleAction } = body
 
     if (!action) {
       return NextResponse.json(
@@ -493,6 +693,202 @@ export async function POST(request: NextRequest) {
             success: false,
             error: `Failed to restart interface: ${error.message}`,
             action: 'restart'
+          }, { status: 500 })
+        }
+      
+      case 'scanPort':
+        try {
+          if (!port || !protocol) {
+            return NextResponse.json(
+              { success: false, error: 'Port and protocol required for port scan' },
+              { status: 400 }
+            )
+          }
+          
+          const targetHost = target || 'localhost'
+          const scanCommand = protocol === 'tcp' 
+            ? `nc -z -w1 ${targetHost} ${port} 2>/dev/null && echo "open" || echo "closed"`
+            : `nc -u -z -w1 ${targetHost} ${port} 2>/dev/null && echo "open" || echo "closed"`
+          
+          const { stdout } = await execAsync(scanCommand)
+          const portState = stdout.trim() === 'open' ? 'open' : 'closed'
+          
+          return NextResponse.json({
+            success: true,
+            message: `Port scan completed for ${protocol.toUpperCase()} port ${port} on ${targetHost}`,
+            action: 'scanPort',
+            data: { 
+              target: targetHost,
+              port: parseInt(port),
+              protocol,
+              state: portState
+            }
+          })
+        } catch (error: any) {
+          return NextResponse.json({
+            success: false,
+            error: `Port scan failed: ${error.message}`,
+            action: 'scanPort'
+          }, { status: 500 })
+        }
+      
+      case 'openPort':
+        try {
+          if (!port || !protocol) {
+            return NextResponse.json(
+              { success: false, error: 'Port and protocol required for opening port' },
+              { status: 400 }
+            )
+          }
+          
+          // Add firewall rule to allow port
+          const chain = 'input'
+          const iptableCommand = `iptables -A ${chain.toUpperCase()} -p ${protocol} --dport ${port} -j ACCEPT`
+          
+          await execAsync(iptableCommand)
+          
+          return NextResponse.json({
+            success: true,
+            message: `${protocol.toUpperCase()} port ${port} opened successfully`,
+            action: 'openPort',
+            data: { port: parseInt(port), protocol, chain }
+          })
+        } catch (error: any) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to open port: ${error.message}`,
+            action: 'openPort'
+          }, { status: 500 })
+        }
+      
+      case 'closePort':
+        try {
+          if (!port || !protocol) {
+            return NextResponse.json(
+              { success: false, error: 'Port and protocol required for closing port' },
+              { status: 400 }
+            )
+          }
+          
+          // Remove firewall rule for port
+          const chain = 'input'
+          const iptableCommand = `iptables -D ${chain.toUpperCase()} -p ${protocol} --dport ${port} -j ACCEPT`
+          
+          await execAsync(iptableCommand)
+          
+          return NextResponse.json({
+            success: true,
+            message: `${protocol.toUpperCase()} port ${port} closed successfully`,
+            action: 'closePort',
+            data: { port: parseInt(port), protocol, chain }
+          })
+        } catch (error: any) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to close port: ${error.message}`,
+            action: 'closePort'
+          }, { status: 500 })
+        }
+      
+      case 'addFirewallRule':
+        try {
+          if (!ruleAction || !protocol || !port) {
+            return NextResponse.json(
+              { success: false, error: 'Action, protocol, and port required for firewall rule' },
+              { status: 400 }
+            )
+          }
+          
+          const chain = 'input'
+          const source = body.source || '0.0.0.0/0'
+          const description = body.description || `${ruleAction.toUpperCase()} ${protocol.toUpperCase()} port ${port}`
+          
+          const iptableCommand = `iptables -A ${chain.toUpperCase()} -p ${protocol} --dport ${port} -s ${source} -j ${ruleAction.toUpperCase()}`
+          
+          await execAsync(iptableCommand)
+          
+          return NextResponse.json({
+            success: true,
+            message: `Firewall rule added successfully`,
+            action: 'addFirewallRule',
+            data: { chain, protocol, port: parseInt(port), source, action: ruleAction, description }
+          })
+        } catch (error: any) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to add firewall rule: ${error.message}`,
+            action: 'addFirewallRule'
+          }, { status: 500 })
+        }
+      
+      case 'removeFirewallRule':
+        try {
+          if (!ruleAction || !protocol || !port) {
+            return NextResponse.json(
+              { success: false, error: 'Action, protocol, and port required for removing firewall rule' },
+              { status: 400 }
+            )
+          }
+          
+          const chain = 'input'
+          const source = body.source || '0.0.0.0/0'
+          
+          const iptableCommand = `iptables -D ${chain.toUpperCase()} -p ${protocol} --dport ${port} -s ${source} -j ${ruleAction.toUpperCase()}`
+          
+          await execAsync(iptableCommand)
+          
+          return NextResponse.json({
+            success: true,
+            message: `Firewall rule removed successfully`,
+            action: 'removeFirewallRule',
+            data: { chain, protocol, port: parseInt(port), source, action: ruleAction }
+          })
+        } catch (error: any) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to remove firewall rule: ${error.message}`,
+            action: 'removeFirewallRule'
+          }, { status: 500 })
+        }
+      
+      case 'portForward':
+        try {
+          if (!port || !target) {
+            return NextResponse.json(
+              { success: false, error: 'Port and target required for port forwarding' },
+              { status: 400 }
+            )
+          }
+          
+          const targetPort = body.targetPort || port
+          const forwardProtocol = protocol || 'tcp'
+          
+          // Enable IP forwarding
+          await execAsync('sysctl -w net.ipv4.ip_forward=1')
+          
+          // Add port forwarding rule
+          const forwardCommand = `iptables -t nat -A PREROUTING -p ${forwardProtocol} --dport ${port} -j DNAT --to-destination ${target}:${targetPort}`
+          const masqueradeCommand = 'iptables -t nat -A POSTROUTING -j MASQUERADE'
+          
+          await execAsync(forwardCommand)
+          await execAsync(masqueradeCommand)
+          
+          return NextResponse.json({
+            success: true,
+            message: `Port forwarding set up successfully`,
+            action: 'portForward',
+            data: { 
+              sourcePort: parseInt(port), 
+              target, 
+              targetPort: parseInt(targetPort), 
+              protocol: forwardProtocol 
+            }
+          })
+        } catch (error: any) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to set up port forwarding: ${error.message}`,
+            action: 'portForward'
           }, { status: 500 })
         }
       
