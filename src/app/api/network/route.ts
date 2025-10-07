@@ -384,131 +384,206 @@ async function getRealNetworkData(): Promise<NetworkData> {
     // Get firewall rules
     const firewall: FirewallRule[] = []
     try {
-      // Try multiple firewall commands with fallbacks
-      let firewallOutput = ''
+      // First, detect which firewall is available
+      let firewallType = ''
+      let firewallCommand = ''
       
-      // Try iptables first
+      // Check which firewall is available
       try {
-        const { stdout: iptablesOutput } = await execAsync('iptables -L -n -v --line-numbers 2>/dev/null || iptables -L -n -v 2>/dev/null')
-        firewallOutput = iptablesOutput
-      } catch (iptablesError) {
-        console.log('iptables failed, trying ufw...')
-        
-        // Try ufw as fallback
+        await execAsync('which iptables 2>/dev/null')
+        firewallType = 'iptables'
+        firewallCommand = 'iptables -L -n -v --line-numbers 2>/dev/null || iptables -L -n -v 2>/dev/null'
+      } catch (e) {
         try {
-          const { stdout: ufwOutput } = await execAsync('ufw status verbose 2>/dev/null')
-          firewallOutput = ufwOutput
-        } catch (ufwError) {
-          console.log('ufw failed, trying firewalld...')
-          
-          // Try firewalld as fallback
+          await execAsync('which ufw 2>/dev/null')
+          firewallType = 'ufw'
+          firewallCommand = 'ufw status verbose 2>/dev/null'
+        } catch (e) {
           try {
-            const { stdout: firewalldOutput } = await execAsync('firewall-cmd --list-all 2>/dev/null')
-            firewallOutput = firewalldOutput
-          } catch (firewalldError) {
-            console.log('All firewall commands failed, using mock data')
-            // Use mock data if no firewall is available
-            firewall.push({
-              id: 'mock-1',
-              chain: 'input',
-              action: 'accept',
-              protocol: 'tcp',
-              source: '0.0.0.0/0',
-              destination: '0.0.0.0/0',
-              sourcePort: 'any',
-              destinationPort: '22',
-              enabled: true,
-              description: 'Allow SSH (Mock data - no firewall detected)',
-              hits: 0,
-              lastHit: new Date().toISOString()
-            })
-            // Don't throw error here, we already have mock data
-            return firewall
+            await execAsync('which firewall-cmd 2>/dev/null')
+            firewallType = 'firewalld'
+            firewallCommand = 'firewall-cmd --list-all 2>/dev/null'
+          } catch (e) {
+            firewallType = 'none'
           }
         }
       }
       
-      const lines = firewallOutput.split('\n')
-      let currentChain = ''
+      console.log(`Detected firewall type: ${firewallType}`)
       
-      for (const line of lines) {
-        const trimmedLine = line.trim()
-        
-        // Detect chain headers (iptables format)
-        if (trimmedLine.startsWith('Chain')) {
-          const chainMatch = trimmedLine.match(/Chain\s+(\w+)/)
-          if (chainMatch) {
-            currentChain = chainMatch[1].toLowerCase()
+      if (firewallType === 'none') {
+        // No firewall available, use mock data
+        firewall.push(
+          {
+            id: 'mock-1',
+            chain: 'input',
+            action: 'accept',
+            protocol: 'tcp',
+            source: '0.0.0.0/0',
+            destination: '0.0.0.0/0',
+            sourcePort: 'any',
+            destinationPort: '22',
+            enabled: true,
+            description: 'Allow SSH (No firewall detected)',
+            hits: 0,
+            lastHit: new Date().toISOString()
+          },
+          {
+            id: 'mock-2',
+            chain: 'input',
+            action: 'accept',
+            protocol: 'tcp',
+            source: '0.0.0.0/0',
+            destination: '0.0.0.0/0',
+            sourcePort: 'any',
+            destinationPort: '80',
+            enabled: true,
+            description: 'Allow HTTP (No firewall detected)',
+            hits: 0,
+            lastHit: new Date().toISOString()
+          },
+          {
+            id: 'mock-3',
+            chain: 'input',
+            action: 'accept',
+            protocol: 'tcp',
+            source: '0.0.0.0/0',
+            destination: '0.0.0.0/0',
+            sourcePort: 'any',
+            destinationPort: '443',
+            enabled: true,
+            description: 'Allow HTTPS (No firewall detected)',
+            hits: 0,
+            lastHit: new Date().toISOString()
           }
-          continue
-        }
+        )
+      } else {
+        // Execute the appropriate firewall command
+        const { stdout: firewallOutput } = await execAsync(firewallCommand)
+        const lines = firewallOutput.split('\n')
+        let currentChain = ''
         
-        // Detect ufw status
-        if (trimmedLine.includes('Status:')) {
-          currentChain = 'input'
-          continue
-        }
-        
-        // Skip header lines and empty lines
-        if (trimmedLine === '' || 
-            trimmedLine.startsWith('pkts') || 
-            trimmedLine.startsWith('num') ||
-            trimmedLine.startsWith('Action') ||
-            trimmedLine.startsWith('To') ||
-            trimmedLine.startsWith('From')) {
-          continue
-        }
-        
-        // Parse iptables rule
-        if (firewallOutput.includes('Chain') && currentChain) {
-          const parts = trimmedLine.split(/\s+/)
-          if (parts.length >= 8) {
-            const [, packets, bytes, , , proto, source, destination, ...rest] = parts
+        for (const line of lines) {
+          const trimmedLine = line.trim()
+          
+          // Parse based on firewall type
+          if (firewallType === 'iptables') {
+            // Detect chain headers (iptables format)
+            if (trimmedLine.startsWith('Chain')) {
+              const chainMatch = trimmedLine.match(/Chain\s+(\w+)/)
+              if (chainMatch) {
+                currentChain = chainMatch[1].toLowerCase()
+              }
+              continue
+            }
             
-            // Extract additional info
-            const extraInfo = rest.join(' ')
-            const portMatch = extraInfo.match(/dpt:(\d+)/)
-            const sportMatch = extraInfo.match(/spt:(\d+)/)
-            const actionMatch = extraInfo.match(/(ACCEPT|DROP|REJECT)/)
+            // Skip header lines and empty lines
+            if (trimmedLine === '' || 
+                trimmedLine.startsWith('pkts') || 
+                trimmedLine.startsWith('num')) {
+              continue
+            }
             
-            firewall.push({
-              id: `${currentChain}-${firewall.length + 1}`,
-              chain: currentChain as 'input' | 'output' | 'forward',
-              action: (actionMatch ? actionMatch[1].toLowerCase() : 'accept') as 'accept' | 'drop' | 'reject',
-              protocol: proto.toLowerCase() as 'tcp' | 'udp' | 'icmp' | 'any',
-              source,
-              destination,
-              sourcePort: sportMatch ? sportMatch[1] : 'any',
-              destinationPort: portMatch ? portMatch[1] : 'any',
-              enabled: true,
-              description: extraInfo,
-              hits: parseInt(packets) || 0,
-              lastHit: new Date().toISOString()
-            })
-          }
-        }
-        
-        // Parse ufw rules
-        if (firewallOutput.includes('Status:') && trimmedLine && !trimmedLine.includes('Status:')) {
-          const parts = trimmedLine.split(/\s+/)
-          if (parts.length >= 4) {
-            const [action, direction, , protocol, ...rest] = parts
-            const destination = rest.join(' ')
+            // Parse iptables rule
+            const parts = trimmedLine.split(/\s+/)
+            if (parts.length >= 8) {
+              const [, packets, bytes, , , proto, source, destination, ...rest] = parts
+              
+              // Extract additional info
+              const extraInfo = rest.join(' ')
+              const portMatch = extraInfo.match(/dpt:(\d+)/)
+              const sportMatch = extraInfo.match(/spt:(\d+)/)
+              const actionMatch = extraInfo.match(/(ACCEPT|DROP|REJECT)/)
+              
+              firewall.push({
+                id: `${currentChain}-${firewall.length + 1}`,
+                chain: currentChain as 'input' | 'output' | 'forward',
+                action: (actionMatch ? actionMatch[1].toLowerCase() : 'accept') as 'accept' | 'drop' | 'reject',
+                protocol: proto.toLowerCase() as 'tcp' | 'udp' | 'icmp' | 'any',
+                source,
+                destination,
+                sourcePort: sportMatch ? sportMatch[1] : 'any',
+                destinationPort: portMatch ? portMatch[1] : 'any',
+                enabled: true,
+                description: extraInfo,
+                hits: parseInt(packets) || 0,
+                lastHit: new Date().toISOString()
+              })
+            }
+          } else if (firewallType === 'ufw') {
+            // Detect ufw status
+            if (trimmedLine.includes('Status:')) {
+              currentChain = 'input'
+              continue
+            }
             
-            firewall.push({
-              id: `ufw-${firewall.length + 1}`,
-              chain: 'input',
-              action: action.toLowerCase() as 'accept' | 'drop' | 'reject',
-              protocol: protocol.toLowerCase() as 'tcp' | 'udp' | 'icmp' | 'any',
-              source: direction === 'IN' ? '0.0.0.0/0' : destination,
-              destination: '0.0.0.0/0',
-              sourcePort: 'any',
-              destinationPort: 'any',
-              enabled: true,
-              description: `UFW rule: ${trimmedLine}`,
-              hits: 0,
-              lastHit: new Date().toISOString()
-            })
+            // Skip header lines and empty lines
+            if (trimmedLine === '' || 
+                trimmedLine.startsWith('Status:') ||
+                trimmedLine.startsWith('Action') ||
+                trimmedLine.startsWith('To') ||
+                trimmedLine.startsWith('From')) {
+              continue
+            }
+            
+            // Parse ufw rules
+            if (trimmedLine && !trimmedLine.includes('Status:')) {
+              const parts = trimmedLine.split(/\s+/)
+              if (parts.length >= 4) {
+                const [action, direction, , protocol, ...rest] = parts
+                const destination = rest.join(' ')
+                
+                firewall.push({
+                  id: `ufw-${firewall.length + 1}`,
+                  chain: 'input',
+                  action: action.toLowerCase() as 'accept' | 'drop' | 'reject',
+                  protocol: protocol.toLowerCase() as 'tcp' | 'udp' | 'icmp' | 'any',
+                  source: direction === 'IN' ? '0.0.0.0/0' : destination,
+                  destination: '0.0.0.0/0',
+                  sourcePort: 'any',
+                  destinationPort: 'any',
+                  enabled: true,
+                  description: `UFW rule: ${trimmedLine}`,
+                  hits: 0,
+                  lastHit: new Date().toISOString()
+                })
+              }
+            }
+          } else if (firewallType === 'firewalld') {
+            // Parse firewalld output (simplified)
+            if (trimmedLine.includes('services:') || trimmedLine.includes('ports:')) {
+              const parts = trimmedLine.split(':')
+              if (parts.length >= 2) {
+                const key = parts[0].trim()
+                const values = parts[1].trim()
+                
+                if (values && values !== '') {
+                  const items = values.split(/\s+/)
+                  items.forEach(item => {
+                    if (item && item !== '') {
+                      // Check if it's a port (contains /) or service
+                      if (item.includes('/')) {
+                        const [port, protocol] = item.split('/')
+                        firewall.push({
+                          id: `firewalld-${firewall.length + 1}`,
+                          chain: 'input',
+                          action: 'accept',
+                          protocol: protocol.toLowerCase() as 'tcp' | 'udp' | 'icmp' | 'any',
+                          source: '0.0.0.0/0',
+                          destination: '0.0.0.0/0',
+                          sourcePort: 'any',
+                          destinationPort: port,
+                          enabled: true,
+                          description: `Firewalld ${key}: ${item}`,
+                          hits: 0,
+                          lastHit: new Date().toISOString()
+                        })
+                      }
+                    }
+                  })
+                }
+              }
+            }
           }
         }
       }
@@ -527,7 +602,7 @@ async function getRealNetworkData(): Promise<NetworkData> {
             sourcePort: 'any',
             destinationPort: '22',
             enabled: true,
-            description: 'Allow SSH (Mock data - no firewall detected)',
+            description: 'Allow SSH (No firewall detected)',
             hits: 0,
             lastHit: new Date().toISOString()
           },
@@ -541,7 +616,7 @@ async function getRealNetworkData(): Promise<NetworkData> {
             sourcePort: 'any',
             destinationPort: '80',
             enabled: true,
-            description: 'Allow HTTP (Mock data - no firewall detected)',
+            description: 'Allow HTTP (No firewall detected)',
             hits: 0,
             lastHit: new Date().toISOString()
           },
@@ -555,7 +630,7 @@ async function getRealNetworkData(): Promise<NetworkData> {
             sourcePort: 'any',
             destinationPort: '443',
             enabled: true,
-            description: 'Allow HTTPS (Mock data - no firewall detected)',
+            description: 'Allow HTTPS (No firewall detected)',
             hits: 0,
             lastHit: new Date().toISOString()
           }
@@ -892,46 +967,46 @@ export async function POST(request: NextRequest) {
             )
           }
           
-          // Try multiple firewall commands with fallbacks
-          let success = false
-          let usedCommand = ''
-          
-          // Try iptables first
+          // Detect available firewall
+          let firewallType = ''
           try {
-            const chain = 'input'
-            const iptableCommand = `iptables -A ${chain.toUpperCase()} -p ${protocol} --dport ${port} -j ACCEPT`
-            await execAsync(iptableCommand)
-            success = true
-            usedCommand = 'iptables'
-          } catch (iptablesError) {
-            console.log('iptables failed, trying ufw...')
-            
-            // Try ufw as fallback
+            await execAsync('which iptables 2>/dev/null')
+            firewallType = 'iptables'
+          } catch (e) {
             try {
-              const ufwCommand = `ufw allow ${port}/${protocol}`
-              await execAsync(ufwCommand)
-              success = true
-              usedCommand = 'ufw'
-            } catch (ufwError) {
-              console.log('ufw failed, trying firewalld...')
-              
-              // Try firewalld as fallback
+              await execAsync('which ufw 2>/dev/null')
+              firewallType = 'ufw'
+            } catch (e) {
               try {
-                const firewalldCommand = `firewall-cmd --permanent --add-port=${port}/${protocol} && firewall-cmd --reload`
-                await execAsync(firewalldCommand)
-                success = true
-                usedCommand = 'firewalld'
-              } catch (firewalldError) {
-                throw new Error('No firewall available or insufficient permissions')
+                await execAsync('which firewall-cmd 2>/dev/null')
+                firewallType = 'firewalld'
+              } catch (e) {
+                throw new Error('No firewall available')
               }
             }
           }
           
+          // Use the detected firewall
+          let command = ''
+          switch (firewallType) {
+            case 'iptables':
+              command = `iptables -A INPUT -p ${protocol} --dport ${port} -j ACCEPT`
+              break
+            case 'ufw':
+              command = `ufw allow ${port}/${protocol}`
+              break
+            case 'firewalld':
+              command = `firewall-cmd --permanent --add-port=${port}/${protocol} && firewall-cmd --reload`
+              break
+          }
+          
+          await execAsync(command)
+          
           return NextResponse.json({
             success: true,
-            message: `${protocol.toUpperCase()} port ${port} opened successfully using ${usedCommand}`,
+            message: `${protocol.toUpperCase()} port ${port} opened successfully using ${firewallType}`,
             action: 'openPort',
-            data: { port: parseInt(port), protocol, firewall: usedCommand }
+            data: { port: parseInt(port), protocol, firewall: firewallType }
           })
         } catch (error: any) {
           return NextResponse.json({
@@ -950,46 +1025,46 @@ export async function POST(request: NextRequest) {
             )
           }
           
-          // Try multiple firewall commands with fallbacks
-          let success = false
-          let usedCommand = ''
-          
-          // Try iptables first
+          // Detect available firewall
+          let firewallType = ''
           try {
-            const chain = 'input'
-            const iptableCommand = `iptables -D ${chain.toUpperCase()} -p ${protocol} --dport ${port} -j ACCEPT`
-            await execAsync(iptableCommand)
-            success = true
-            usedCommand = 'iptables'
-          } catch (iptablesError) {
-            console.log('iptables failed, trying ufw...')
-            
-            // Try ufw as fallback
+            await execAsync('which iptables 2>/dev/null')
+            firewallType = 'iptables'
+          } catch (e) {
             try {
-              const ufwCommand = `ufw deny ${port}/${protocol}`
-              await execAsync(ufwCommand)
-              success = true
-              usedCommand = 'ufw'
-            } catch (ufwError) {
-              console.log('ufw failed, trying firewalld...')
-              
-              // Try firewalld as fallback
+              await execAsync('which ufw 2>/dev/null')
+              firewallType = 'ufw'
+            } catch (e) {
               try {
-                const firewalldCommand = `firewall-cmd --permanent --remove-port=${port}/${protocol} && firewall-cmd --reload`
-                await execAsync(firewalldCommand)
-                success = true
-                usedCommand = 'firewalld'
-              } catch (firewalldError) {
-                throw new Error('No firewall available or insufficient permissions')
+                await execAsync('which firewall-cmd 2>/dev/null')
+                firewallType = 'firewalld'
+              } catch (e) {
+                throw new Error('No firewall available')
               }
             }
           }
           
+          // Use the detected firewall
+          let command = ''
+          switch (firewallType) {
+            case 'iptables':
+              command = `iptables -D INPUT -p ${protocol} --dport ${port} -j ACCEPT`
+              break
+            case 'ufw':
+              command = `ufw deny ${port}/${protocol}`
+              break
+            case 'firewalld':
+              command = `firewall-cmd --permanent --remove-port=${port}/${protocol} && firewall-cmd --reload`
+              break
+          }
+          
+          await execAsync(command)
+          
           return NextResponse.json({
             success: true,
-            message: `${protocol.toUpperCase()} port ${port} closed successfully using ${usedCommand}`,
+            message: `${protocol.toUpperCase()} port ${port} closed successfully using ${firewallType}`,
             action: 'closePort',
-            data: { port: parseInt(port), protocol, firewall: usedCommand }
+            data: { port: parseInt(port), protocol, firewall: firewallType }
           })
         } catch (error: any) {
           return NextResponse.json({
