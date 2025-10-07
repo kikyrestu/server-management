@@ -422,7 +422,8 @@ async function getRealNetworkData(): Promise<NetworkData> {
               hits: 0,
               lastHit: new Date().toISOString()
             })
-            throw new Error('No firewall available')
+            // Don't throw error here, we already have mock data
+            return firewall
           }
         }
       }
@@ -513,7 +514,53 @@ async function getRealNetworkData(): Promise<NetworkData> {
       }
     } catch (firewallError) {
       console.log('Failed to get firewall info:', firewallError)
-      // Mock data is already added above if no firewall is available
+      // If no firewall data was added yet, add some mock data
+      if (firewall.length === 0) {
+        firewall.push(
+          {
+            id: 'mock-1',
+            chain: 'input',
+            action: 'accept',
+            protocol: 'tcp',
+            source: '0.0.0.0/0',
+            destination: '0.0.0.0/0',
+            sourcePort: 'any',
+            destinationPort: '22',
+            enabled: true,
+            description: 'Allow SSH (Mock data - no firewall detected)',
+            hits: 0,
+            lastHit: new Date().toISOString()
+          },
+          {
+            id: 'mock-2',
+            chain: 'input',
+            action: 'accept',
+            protocol: 'tcp',
+            source: '0.0.0.0/0',
+            destination: '0.0.0.0/0',
+            sourcePort: 'any',
+            destinationPort: '80',
+            enabled: true,
+            description: 'Allow HTTP (Mock data - no firewall detected)',
+            hits: 0,
+            lastHit: new Date().toISOString()
+          },
+          {
+            id: 'mock-3',
+            chain: 'input',
+            action: 'accept',
+            protocol: 'tcp',
+            source: '0.0.0.0/0',
+            destination: '0.0.0.0/0',
+            sourcePort: 'any',
+            destinationPort: '443',
+            enabled: true,
+            description: 'Allow HTTPS (Mock data - no firewall detected)',
+            hits: 0,
+            lastHit: new Date().toISOString()
+          }
+        )
+      }
     }
     
     // Get bandwidth usage (calculate from /proc/net/dev)
