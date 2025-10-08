@@ -315,22 +315,25 @@ async function getRealNetworkData(): Promise<NetworkData> {
     // Process TCP ports
     const tcpLines = tcpOutput.split('\n').slice(1) // Skip header
     for (const line of tcpLines) {
-      const parts = line.split(/\s+/).filter(p => p)
-      if (parts.length >= 3) {
-        const stateIndex = parts.findIndex(p => p === 'LISTEN')
-        if (stateIndex === -1) continue
+      const trimmedLine = line.trim()
+      if (!trimmedLine) continue
+      
+      const parts = trimmedLine.split(/\s+/).filter(p => p)
+      if (parts.length >= 4) {
+        // Find the Local Address:Port column (usually 4th column, index 3)
+        const localAddressPort = parts[3]
         
-        const localAddress = parts[stateIndex - 1]
+        if (!localAddressPort) continue
         
         // Extract port and address - improved regex to handle various formats
-        const addressMatch = localAddress.match(/(?:.*:)?(\d+)$/)
+        const addressMatch = localAddressPort.match(/(?:.*:)?(\d+)$/)
         if (!addressMatch) continue
         
         const port = parseInt(addressMatch[1])
         // Skip port 0 as it's invalid
         if (port === 0 || isNaN(port)) continue
         
-        const localIp = localAddress.includes(':') ? localAddress.split(':')[0] : '0.0.0.0'
+        const localIp = localAddressPort.includes(':') ? localAddressPort.split(':')[0] : '0.0.0.0'
         
         // Get service name - improved with common port mapping
         let service = 'unknown'
@@ -371,22 +374,25 @@ async function getRealNetworkData(): Promise<NetworkData> {
     // Process UDP ports
     const udpLines = udpOutput.split('\n').slice(1) // Skip header
     for (const line of udpLines) {
-      const parts = line.split(/\s+/).filter(p => p)
-      if (parts.length >= 3) {
-        const stateIndex = parts.findIndex(p => p === 'UNCONN')
-        if (stateIndex === -1) continue
+      const trimmedLine = line.trim()
+      if (!trimmedLine) continue
+      
+      const parts = trimmedLine.split(/\s+/).filter(p => p)
+      if (parts.length >= 4) {
+        // Find the Local Address:Port column (usually 4th column, index 3)
+        const localAddressPort = parts[3]
         
-        const localAddress = parts[stateIndex - 1]
+        if (!localAddressPort) continue
         
         // Extract port and address - improved regex to handle various formats
-        const addressMatch = localAddress.match(/(?:.*:)?(\d+)$/)
+        const addressMatch = localAddressPort.match(/(?:.*:)?(\d+)$/)
         if (!addressMatch) continue
         
         const port = parseInt(addressMatch[1])
         // Skip port 0 as it's invalid
         if (port === 0 || isNaN(port)) continue
         
-        const localIp = localAddress.includes(':') ? localAddress.split(':')[0] : '0.0.0.0'
+        const localIp = localAddressPort.includes(':') ? localAddressPort.split(':')[0] : '0.0.0.0'
         
         // Get service name - improved with common port mapping
         let service = 'unknown'
