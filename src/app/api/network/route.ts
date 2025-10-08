@@ -24,15 +24,25 @@ interface NetworkInterface {
   txSpeed: number
   rxErrors: number
   txErrors: number
+  rxDropped?: number
+  txDropped?: number
+  lastUpdated?: string
 }
 
 interface NetworkConnection {
-  protocol: string
+  id: string
+  protocol: 'tcp' | 'udp' | 'icmp'
   localAddress: string
+  localPort: number
   foreignAddress: string
-  state: string
-  pid: number
+  foreignPort: number
+  state: 'established' | 'listen' | 'time_wait' | 'close_wait' | 'syn_sent' | 'syn_recv'
   process: string
+  pid: number
+  user: string
+  rxBytes?: number
+  txBytes?: number
+  duration?: string
 }
 
 interface PortInfo {
@@ -66,15 +76,27 @@ interface NetworkData {
   ports: PortInfo[]
   firewall: FirewallRule[]
   bandwidth: {
-    download: number // Mbps
-    upload: number // Mbps
-  }
+    download: number
+    upload: number
+    totalDownload: number
+    totalUpload: number
+    timestamp: string
+  }[]
   latency: {
-    average: number // ms
-    min: number // ms
-    max: number // ms
+    average: number
+    min: number
+    max: number
   }
-  packetLoss: number // percentage
+  packetLoss: number
+  alerts: Array<{
+    id: string
+    type: 'connectivity' | 'performance' | 'security' | 'configuration'
+    severity: 'info' | 'warning' | 'critical'
+    message: string
+    interface: string
+    timestamp: string
+    resolved: boolean
+  }>
   lastUpdated: string
 }
 
@@ -265,30 +287,72 @@ async function getRealNetworkData(): Promise<NetworkData> {
   // Get network connections
   const connections: NetworkConnection[] = []
   try {
-    const { stdout: connOutput } = await execAsync('netstat -tulpn 2>/dev/null || ss -tulpn 2>/dev/null')
+    const { stdout: connOutput } = await execAsync('ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null')
     const connLines = connOutput.split('\n').slice(1) // Skip header
     
     for (const line of connLines) {
-      const parts = line.split(/\s+/).filter(p => p)
-      if (parts.length >= 6) {
-        const [protocol, , localAddress, foreignAddress, state, processInfo] = parts
+      const trimmedLine = line.trim()
+      if (!trimmedLine) continue
+      
+      const parts = trimmedLine.split(/\s+/).filter(p => p)
+      if (parts.length >= 5) {
+        // Parse ss command output format
+        // State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+        const state = parts[0]
+        const localAddressPort = parts[3]
+        const foreignAddressPort = parts[4]
+        const processInfo = parts[6] || ''
+        
+        // Parse local address and port
+        const localMatch = localAddressPort.match(/(?:.*:)?(\d+)$/)
+        if (!localMatch) continue
+        const localPort = parseInt(localMatch[1])
+        const localAddress = localAddressPort.includes(':') ? localAddressPort.split(':')[0] : '0.0.0.0'
+        
+        // Parse foreign address and port
+        const foreignMatch = foreignAddressPort.match(/(?:.*:)?(\d+)$/)
+        if (!foreignMatch) continue
+        const foreignPort = parseInt(foreignMatch[1])
+        const foreignAddress = foreignAddressPort.includes(':') ? foreignAddressPort.split(':')[0] : '0.0.0.0'
         
         // Extract PID and process name
         let pid = 0
         let process = 'Unknown'
-        const pidMatch = processInfo.match(/(\d+)\/(.+)/)
+        const pidMatch = processInfo.match(/"?(\d+)"?/)
         if (pidMatch) {
           pid = parseInt(pidMatch[1])
-          process = pidMatch[2]
+          const nameMatch = processInfo.match(/"?(\d+)"?,?"?([^"]*)"?/)
+          if (nameMatch && nameMatch[2]) {
+            process = nameMatch[2]
+          }
         }
         
+        // Map state to expected values
+        let connectionState: 'established' | 'listen' | 'time_wait' | 'close_wait' | 'syn_sent' | 'syn_recv' = 'established'
+        if (state.includes('LISTEN')) connectionState = 'listen'
+        else if (state.includes('ESTAB')) connectionState = 'established'
+        else if (state.includes('TIME_WAIT')) connectionState = 'time_wait'
+        else if (state.includes('CLOSE_WAIT')) connectionState = 'close_wait'
+        else if (state.includes('SYN_SENT')) connectionState = 'syn_sent'
+        else if (state.includes('SYN_RECV')) connectionState = 'syn_recv'
+        
+        // Determine protocol
+        let protocol: 'tcp' | 'udp' | 'icmp' = 'tcp'
+        if (trimmedLine.toLowerCase().includes('udp')) protocol = 'udp'
+        else if (trimmedLine.toLowerCase().includes('icmp')) protocol = 'icmp'
+        
         connections.push({
+          id: `conn-${connections.length + 1}`,
           protocol,
           localAddress,
+          localPort,
           foreignAddress,
-          state,
+          foreignPort,
+          state: connectionState,
+          process,
           pid,
-          process
+          user: 'unknown',
+          duration: 'N/A'
         })
       }
     }
@@ -613,7 +677,7 @@ async function getRealNetworkData(): Promise<NetworkData> {
   }
   
   // Calculate bandwidth and latency (simplified)
-  const bandwidth = {
+  const currentBandwidth = {
     download: 0, // Will be calculated from interface data
     upload: 0
   }
@@ -627,12 +691,23 @@ async function getRealNetworkData(): Promise<NetworkData> {
   const packetLoss = 0
   
   // Calculate bandwidth from interface data
+  let totalDownload = 0
+  let totalUpload = 0
+  let currentDownload = 0
+  let currentUpload = 0
+  
   if (interfaces.length > 0) {
     const primaryInterface = interfaces.find(iface => iface.name !== 'lo' && iface.status === 'up') || interfaces[0]
     if (primaryInterface) {
       // Convert bytes to Mbps (rough estimation)
-      bandwidth.download = Math.round((primaryInterface.rxBytes * 8) / (1024 * 1024))
-      bandwidth.upload = Math.round((primaryInterface.txBytes * 8) / (1024 * 1024))
+      currentDownload = Math.round((primaryInterface.rxBytes * 8) / (1024 * 1024))
+      currentUpload = Math.round((primaryInterface.txBytes * 8) / (1024 * 1024))
+      totalDownload = primaryInterface.rxBytes
+      totalUpload = primaryInterface.txBytes
+      
+      // Update interface with speed data
+      primaryInterface.rxSpeed = currentDownload * 1024 * 1024 / 8 // Convert back to bytes/s
+      primaryInterface.txSpeed = currentUpload * 1024 * 1024 / 8
     }
   }
   
@@ -649,14 +724,51 @@ async function getRealNetworkData(): Promise<NetworkData> {
     console.log('Failed to get latency info:', pingError)
   }
   
+  // Create bandwidth array for frontend compatibility
+  const bandwidthArray = [{
+    download: currentDownload * 1024 * 1024 / 8, // Convert to bytes/s
+    upload: currentUpload * 1024 * 1024 / 8,     // Convert to bytes/s
+    totalDownload,
+    totalUpload,
+    timestamp: new Date().toISOString()
+  }]
+  
+  // Generate some alerts based on network status
+  const alerts = []
+  const downInterfaces = interfaces.filter(iface => iface.status === 'down')
+  if (downInterfaces.length > 0) {
+    alerts.push({
+      id: `down-${Date.now()}`,
+      type: 'connectivity' as const,
+      severity: 'critical' as const,
+      message: `Interface ${downInterfaces[0].name} is down`,
+      interface: downInterfaces[0].name,
+      timestamp: new Date().toISOString(),
+      resolved: false
+    })
+  }
+  
+  if (latency.average > 100) {
+    alerts.push({
+      id: `latency-${Date.now()}`,
+      type: 'performance' as const,
+      severity: 'warning' as const,
+      message: `High latency detected: ${latency.average}ms`,
+      interface: 'network',
+      timestamp: new Date().toISOString(),
+      resolved: false
+    })
+  }
+  
   return {
     interfaces,
     connections,
     ports,
     firewall,
-    bandwidth,
+    bandwidth: bandwidthArray,
     latency,
     packetLoss,
+    alerts,
     lastUpdated: new Date().toISOString()
   }
 }
@@ -739,6 +851,7 @@ export async function POST(request: NextRequest) {
         const { port, protocol, targetPort, targetIP } = params
         try {
           await execAsync(`sudo -n iptables -t nat -A PREROUTING -p ${protocol} --dport ${port} -j DNAT --to-destination ${targetIP}:${targetPort}`)
+          await execAsync(`sudo -n iptables -A FORWARD -p ${protocol} -d ${targetIP} --dport ${targetPort} -j ACCEPT`)
           return NextResponse.json({
             success: true,
             message: `Port forwarding from ${port} to ${targetIP}:${targetPort} set up successfully`,
@@ -749,6 +862,98 @@ export async function POST(request: NextRequest) {
             success: false,
             error: `Failed to set up port forwarding: ${error.message}`,
             action: 'portForward'
+          }, { status: 500 })
+        }
+
+      case 'addPortRule':
+        const { port: addPort, protocol: addProtocol, action: portAction } = params
+        try {
+          if (portAction === 'open') {
+            await execAsync(`sudo -n iptables -A INPUT -p ${addProtocol} --dport ${addPort} -j ACCEPT`)
+          } else {
+            await execAsync(`sudo -n iptables -A INPUT -p ${addProtocol} --dport ${addPort} -j DROP`)
+          }
+          return NextResponse.json({
+            success: true,
+            message: `Port ${addPort}/${addProtocol} ${portAction}ed successfully`,
+            action: 'addPortRule'
+          })
+        } catch (error) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to ${portAction} port: ${error.message}`,
+            action: 'addPortRule'
+          }, { status: 500 })
+        }
+
+      case 'scanPort':
+        const { target: scanTarget, port: scanPort, protocol: scanProtocol } = params
+        try {
+          const { stdout } = await execAsync(`nc -z -v -${scanProtocol === 'tcp' ? 't' : 'u'} ${scanTarget} ${scanPort} 2>&1 || echo "Connection failed"`)
+          const isOpen = stdout.includes('succeeded') || stdout.includes('open')
+          return NextResponse.json({
+            success: true,
+            message: `Port ${scanPort}/${scanProtocol} on ${scanTarget} is ${isOpen ? 'open' : 'closed'}`,
+            result: { isOpen, output: stdout },
+            action: 'scanPort'
+          })
+        } catch (error) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to scan port: ${error.message}`,
+            action: 'scanPort'
+          }, { status: 500 })
+        }
+
+      case 'bringInterfaceUp':
+        const { interface: upInterface } = params
+        try {
+          await execAsync(`sudo -n ip link set ${upInterface} up`)
+          return NextResponse.json({
+            success: true,
+            message: `Interface ${upInterface} brought up successfully`,
+            action: 'bringInterfaceUp'
+          })
+        } catch (error) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to bring interface up: ${error.message}`,
+            action: 'bringInterfaceUp'
+          }, { status: 500 })
+        }
+
+      case 'bringInterfaceDown':
+        const { interface: downInterface } = params
+        try {
+          await execAsync(`sudo -n ip link set ${downInterface} down`)
+          return NextResponse.json({
+            success: true,
+            message: `Interface ${downInterface} brought down successfully`,
+            action: 'bringInterfaceDown'
+          })
+        } catch (error) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to bring interface down: ${error.message}`,
+            action: 'bringInterfaceDown'
+          }, { status: 500 })
+        }
+
+      case 'addInterface':
+        const { name, type, ip, netmask } = params
+        try {
+          await execAsync(`sudo -n ip addr add ${ip}/${netmask} dev ${name}`)
+          await execAsync(`sudo -n ip link set ${name} up`)
+          return NextResponse.json({
+            success: true,
+            message: `Interface ${name} added successfully`,
+            action: 'addInterface'
+          })
+        } catch (error) {
+          return NextResponse.json({
+            success: false,
+            error: `Failed to add interface: ${error.message}`,
+            action: 'addInterface'
           }, { status: 500 })
         }
 
